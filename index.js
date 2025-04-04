@@ -9,7 +9,6 @@ import { Client } from '@notionhq/client';
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const notion = new Client({ auth: process.env.NOTION_API_KEY });
 
-
 // ID базы данных Notion
 const databaseId = process.env.NOTION_DB_ID;
 
@@ -19,7 +18,7 @@ let subcatOptions = [];
 let accountOptions = [];
 
 // Временное хранилище для каждого пользователя
-// userState[userId] = { chosenCategory: null, chosenSubcategory: null, ... }
+// userState[userId] = { sum, title, currency, dateString, category, subcategory, account }
 const userState = {};
 
 /**
@@ -33,39 +32,76 @@ function getRussianMonthName(monthIndex) {
     return months[monthIndex] || 'Неизвестный месяц';
 }
 
-// --- Вспомогательная функция: парсим строку вида "3000.45 Такси до отеля USD"
-function parseUserInput(input) {
-    // Разбиваем по пробелам
-    const tokens = input.trim().split(/\s+/);
-
-    if (!tokens.length) return null;
-
-    // 1) Первая часть — сумма
-    const sumRaw = tokens[0];
-    const sum = parseFloat(sumRaw.replace(',', '.')); // на случай, если пользователь пишет 3000,50
-    if (isNaN(sum)) {
-        return null; // не число
-    }
-
-    // 2) Проверяем последнюю часть на валюта ли это
-    // Разрешённые валюты
+function isValidCurrency(str) {
     const allowedCurrencies = ['TRY', 'GEL', 'USD', 'RUB'];
-    let currency = 'RUB';
-    let titleTokens = tokens.slice(1); // всё, кроме первого
-
-    const lastToken = titleTokens[titleTokens.length - 1];
-    if (allowedCurrencies.includes(lastToken?.toUpperCase())) {
-        currency = lastToken.toUpperCase();
-        titleTokens = titleTokens.slice(0, -1); // убираем последний
-    }
-
-    // 3) Всё, что осталось в середине, — это название (может быть с пробелами)
-    const title = titleTokens.join(' ').trim() || '(без названия)';
-
-    return { sum, title, currency };
+    return allowedCurrencies.includes(str.toUpperCase());
 }
 
-// 1) При запуске бота загружаем схему базы и извлекаем варианты select
+function isValidShortDateFormat(str) {
+    return /^\d{6}$/.test(str); // 6 цифр
+}
+
+/**
+ * Преобразование ддммгг → Date (UTC).
+ * Если yy < 50 => 20yy, иначе => 19yy
+ */
+function parseShortDateString(str) {
+    // ддммгг -> yyyy-mm-dd
+    const dd = parseInt(str.slice(0, 2), 10);
+    const mm = parseInt(str.slice(2, 4), 10);
+    const yy = parseInt(str.slice(4, 6), 10);
+
+    // if yy<50 => 20yy, else => 19yy
+    let fullYear = (yy < 50) ? (2000 + yy) : (1900 + yy);
+
+    // Создаём дату в UTC
+    return new Date(Date.UTC(fullYear, mm - 1, dd, 12));
+}
+
+
+/**
+ * Парсим строку вида "3000 такси USD 020225".
+ * Формат: <сумма> <название ...> [валюта] [ддммгг]
+ */
+function parseUserInput(input) {
+    const tokens = input.trim().split(/\s+/);
+    if (!tokens.length) return null;
+
+    // 1) Сумма (первый токен)
+    const sumRaw = tokens[0];
+    const sum = parseFloat(sumRaw.replace(',', '.'));
+    if (isNaN(sum)) {
+        return null;
+    }
+
+    // Список оставшихся частей
+    let remaining = tokens.slice(1);
+
+    let currency = 'RUB';
+    let dateString = null;
+
+    // Проверяем последний токен, может это дата (6 цифр)
+    let lastToken = remaining[remaining.length - 1];
+    if (lastToken && isValidShortDateFormat(lastToken)) {
+        dateString = lastToken;
+        remaining.pop();
+        lastToken = remaining[remaining.length - 1];
+    }
+
+    // Теперь проверим, вдруг этот lastToken - валюта
+    if (lastToken && isValidCurrency(lastToken)) {
+        currency = lastToken.toUpperCase();
+        remaining.pop();
+        lastToken = remaining[remaining.length - 1];
+    }
+
+    // Всё, что осталось - название
+    const title = remaining.join(' ').trim() || '(без названия)';
+
+    return { sum, title, currency, dateString };
+}
+
+// Загрузим схему базы и извлечём варианты select
 const dbInfo = await notion.databases.retrieve({ database_id: databaseId });
 
 const catProp = dbInfo.properties['Категория'];
@@ -82,149 +118,163 @@ if (accountProp?.type === 'select') {
     accountOptions = accountProp.select.options;
 }
 
-console.log(dbInfo)
-console.log('Список категорий из Notion:', categoryOptions.map(o => o.name));
-console.log('Список подкатегорий из Notion:', subcatOptions.map(o => o.name));
-console.log('Список счетов из Notion:', accountOptions.map(o => o.name));
-
-
-// 2) Определяем логику бота
+console.log('БД из Notion:', dbInfo);
+console.log('Категории из Notion:', categoryOptions.map(o => o.name));
+console.log('Подкатегории из Notion:', subcatOptions.map(o => o.name));
+console.log('Счета из Notion:', accountOptions.map(o => o.name));
 
 // Команда /start — приветствие
 bot.start((ctx) => {
     ctx.reply(
-        'Привет! Для добавления операции напиши:\n' +
-        'сумма название [валюта]\n\n' +
-        'Пример: "3000.45 Такси до отеля USD"\n' +
-        'или: "1500 Жевачка"\n'
+        'Привет! Для добавления операции введи:\n' +
+        'сумма название [валюта] [ддммгггг]\n\n' +
+        'Примеры:\n' +
+        '"300 такси до отеля"\n' +
+        '"300 такси до отеля USD"\n' +
+        '"300 такси до отеля USD 090425"\n' +
+        '"500 продукты 150425"\n'
     );
 });
 
-// Хендлер для произвольного текста (шаг 2 - ввод данных)
+// При вводе текста парсим данные
 bot.on('text', async (ctx) => {
     const userId = ctx.from.id;
     const parsed = parseUserInput(ctx.message.text);
     if (!parsed) {
         return ctx.reply(
-            'Не удалось распознать данные. Формат: "3000.45 Название [опц. валюта]".'
+            'Не удалось распознать данные. Формат: "300 Название [валюта] [ддммгг]"'
         );
     }
 
-    const { sum, title, currency } = parsed;
+    const { sum, title, currency, dateString } = parsed;
 
     // Сохраняем во временное состояние
     userState[userId] = {
         sum,
         title,
         currency,
+        dateString,
         category: null,
         subcategory: null,
         account: null
     };
 
-    // 3) Предлагаем выбрать Категорию
-    // Формируем кнопки: callback_data = `cat_0`, `cat_1`, ...
+    // Предлагаем выбрать Категорию (все категории)
     const catButtons = categoryOptions.map((opt, idx) => [
-        Markup.button.callback(opt.name, `cat_${idx}`)
+        Markup.button.callback(`${opt.name}`, `cat_${idx}`)
     ]);
 
     return ctx.reply(
-        `Сумма: ${sum}, Название: "${title}", Валюта: ${currency}.\nВыберите категорию:`,
+        `Сумма: ${sum}, Название: "${title}", Валюта: ${currency}` +
+        (dateString ? `, Дата: ${dateString}` : '') +
+        `\nВыберите категорию:`,
         Markup.inlineKeyboard(catButtons)
     );
 });
 
-// 4) Нажатие кнопки "Категория"
+// Обработка нажатия кнопки Категория
 bot.action(/^cat_(\d+)/, async (ctx) => {
     const userId = ctx.from.id;
     const idx = Number(ctx.match[1]);
-
     const chosenCat = categoryOptions[idx];
+
     if (!chosenCat) {
         await ctx.answerCbQuery();
-        return ctx.reply('Категория не найдена. Введите операцию заново.');
+        return ctx.reply('Категория не найдена. Введите заново.');
     }
 
-    // Сохраняем категорию
+    // Сохраняем название и цвет категории
     userState[userId].category = chosenCat.name;
+    const catColor = chosenCat.color; // Важная часть
 
-    // Предлагаем выбрать подкатегорию
-    const subcatButtons = subcatOptions.map((opt, sidx) => [
-        Markup.button.callback(opt.name, `subcat_${sidx}`)
+    // Предлагаем выбрать Подкатегорию
+    // - Показываем ТОЛЬКО те подкатегории, чьё subcat.color == catColor
+    const filteredSubcats = subcatOptions.filter((sub) => sub.color === catColor);
+
+    if (!filteredSubcats.length) {
+        await ctx.answerCbQuery();
+        return ctx.reply(
+            `Категория выбрана: ${chosenCat.name}\n` +
+            `Нет подкатегорий с цветом (${catColor}). Пожалуйста, выберите другую категорию или настройте цвета в Notion.`
+        );
+    }
+
+    const subcatButtons = filteredSubcats.map((opt, sidx) => [
+        Markup.button.callback(opt.name, `subcat_${opt.id}`)
     ]);
 
     await ctx.answerCbQuery();
     return ctx.reply(
-        `Категория выбрана: ${chosenCat.name}.\nВыберите подкатегорию:`,
+        `Категория выбрана: ${chosenCat.name}\nВыберите подкатегорию:`,
         Markup.inlineKeyboard(subcatButtons)
     );
 });
 
-// 5) Нажатие кнопки "Подкатегория"
-bot.action(/^subcat_(\d+)/, async (ctx) => {
+// Обработка нажатия кнопки Подкатегория
+// callback_data: "subcat_optnID"
+bot.action(/^subcat_(.+)/, async (ctx) => {
     const userId = ctx.from.id;
-    const sidx = Number(ctx.match[1]);
+    const subcatId = ctx.match[1]; // id в массиве subcatOptions
 
-    const chosenSubcat = subcatOptions[sidx];
+    // Ищем соответствующую подкатегорию
+    const chosenSubcat = subcatOptions.find((o) => o.id === subcatId);
+
     if (!chosenSubcat) {
         await ctx.answerCbQuery();
-        return ctx.reply('Подкатегория не найдена. Введите операцию заново.');
+        return ctx.reply('Подкатегория не найдена. Введите заново.');
     }
 
     userState[userId].subcategory = chosenSubcat.name;
 
-    // Предлагаем выбрать "Счёт"
+    // Предлагаем выбрать Счёт
     const acctButtons = accountOptions.map((opt, aidx) => [
         Markup.button.callback(opt.name, `acct_${aidx}`)
     ]);
 
     await ctx.answerCbQuery();
     return ctx.reply(
-        `Подкатегория выбрана: ${chosenSubcat.name}.\nТеперь выберите счёт:`,
+        `Подкатегория выбрана: ${chosenSubcat.name}\nТеперь выберите счёт:`,
         Markup.inlineKeyboard(acctButtons)
     );
 });
 
-// 6) Нажатие кнопки "Счёт"
+// Обработка нажатия кнопки Счёт
 bot.action(/^acct_(\d+)/, async (ctx) => {
     const userId = ctx.from.id;
     const aidx = Number(ctx.match[1]);
-
     const chosenAcct = accountOptions[aidx];
+
     if (!chosenAcct) {
         await ctx.answerCbQuery();
-        return ctx.reply('Счёт не найден. Введите операцию заново.');
+        return ctx.reply('Счёт не найден. Введите заново.');
     }
 
-    // Сохраняем "Счёт"
     userState[userId].account = chosenAcct.name;
 
-    const { sum, title, currency, category, subcategory, account } = userState[userId];
-    delete userState[userId]; // очистили память
+    // Считываем всё и очищаем
+    const { sum, title, currency, dateString, category, subcategory, account } = userState[userId];
+    delete userState[userId];
 
-    // Определяем текущий месяц
-    const now = new Date();
-    const monthName = getRussianMonthName(now.getMonth());
-    const year = now.getFullYear().toString();
+    // Определяем дату (если dateString есть — парсим, иначе сегодня)
+    let targetDate = new Date();
+    if (dateString) {
+        targetDate = parseShortDateString(dateString);
+    }
 
-    console.log(monthName);
-    console.log(year)
+    // Вычисляем Месяц и Год
+    const monthName = getRussianMonthName(targetDate.getMonth());
+    const year = targetDate.getFullYear().toString();
 
-    // Теперь создаём запись в Notion. Заполняем как минимум:
-    // - "Название" (Title)
-    // - "Сумма" (Number)
-    // - "Категория" (Select)
-    // - "Подкатегория" (Select)
-    // - "Счёт" (Select)
-    // - "Валюта" (Select)
-    // И т. д. — при желании можно добавить "Дата", "Месяц", "Год", "Статус"…
+    // Формируем ISO-дату (YYYY-MM-DD), чтобы передавать в Notion
+    const isoDate = targetDate.toISOString().split('T')[0];
 
+    // Создаём запись в Notion
     try {
         await notion.pages.create({
             parent: { database_id: databaseId },
             properties: {
                 'Дата': {
-                    date: { start: new Date().toISOString().split('T')[0] }
+                    date: { start: isoDate }
                 },
                 'Месяц': {
                     select: { name: monthName }
@@ -262,8 +312,9 @@ bot.action(/^acct_(\d+)/, async (ctx) => {
         await ctx.answerCbQuery();
         return ctx.reply(
             `✅ Запись добавлена в Notion!\n` +
-            `Сумма: ${sum},\nНазвание: ${title},\nВалюта: ${currency},\n` +
-            `Категория: ${category},\nПодкатегория: ${subcategory},\nСчёт: ${account}`
+            `Сумма: ${sum}\nНазвание: ${title}\nВалюта: ${currency}\n` +
+            `Категория: ${category}\nПодкатегория: ${subcategory}\nСчёт: ${account}\n` +
+            `Дата: ${isoDate} (Месяц: ${monthName}, Год: ${year})`
         );
     } catch (error) {
         console.error('Ошибка при создании страницы в Notion:', error);
@@ -272,6 +323,6 @@ bot.action(/^acct_(\d+)/, async (ctx) => {
     }
 });
 
-// 7) Запуск бота
+// Запуск бота
 await bot.launch();
 console.log('Бот запущен!');
